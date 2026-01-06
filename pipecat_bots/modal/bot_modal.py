@@ -31,7 +31,8 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
-from pipecat.processors.aggregators.sentence import SentenceAggregator
+# Use our custom SentenceAggregator that flushes on LLMFullResponseEndFrame
+from ..sentence_aggregator import SentenceAggregator
 from pipecat.processors.frameworks.rtvi import RTVIConfig, RTVIObserver, RTVIProcessor
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
@@ -59,7 +60,7 @@ NVIDIA_LLM_MODEL = os.getenv(
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 )
 NVIDIA_LLM_API_KEY = os.getenv("NVIDIA_LLM_API_KEY", "not-needed")
-tts_instance = modal.Cls.from_name("magpie-tts-server", "MagpieTTSModel")()
+tts_instance = modal.Cls.from_name("magpie-tts-server", "MagpieTTSServer")()
 NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", tts_instance.api.get_web_url())
 
 # VAD configuration - used by both VAD analyzer and V2V metrics

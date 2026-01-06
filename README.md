@@ -55,8 +55,8 @@ Create a [Modal](modal.com) account if you don't have one.
 Then, install the necessary dependencies using `uv` with optional dependency group `modal` and authenticate your account.
 
 ```bash
-# Install Modal dependency
-uv sync --group modal
+# Install Modal and Pipecat Cloud dependencies
+uv sync --extra modal --extra bot
 
 # Authenticate with Modal
 modal setup
@@ -77,7 +77,7 @@ modal deploy -m src.nemotron_speech.modal.vllm_modal
 
 The ASR deployment takes about 30 seconds to cold-start, 60 seconds for TTS, and about 3 minutes for vLLM. You can uncomment the `min_containers = 1` input to the Modal `Function` and `Cls` decorators to ensure that bots can start up quickly for production or development.
 
-#### 3. Run the bot locally or using Pipecat Cloud
+#### 3. Run the bot locally or using Pipecat Cloud (see below)
 
 ```bash
 uv run -m pipecat_bots.modal.bot_modal
@@ -92,7 +92,9 @@ uv run -m pipecat_bots.modal.bot_modal
 
 ```bash
 # Install Pipecat Cloud package
-uv sync --group bot
+uv sync --extra bot
+# Or Pipecat Cloud and Modal
+uv sync --extra bot --extra modal
 
 # Login
 pipecat cloud auth login

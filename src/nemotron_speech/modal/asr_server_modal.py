@@ -4,13 +4,11 @@ Deploy to Modal with GPU support for real-time speech recognition.
 
 Usage:
     # Deploy to Modal
-    modal deploy src/nemotron_speech/modal/asr_server_modal.py
+    modal deploy -m src.nemotron_speech.modal.asr_server_modal
 
     # Test locally
-    python src/nemotron_speech/modal/asr_server_modal.py
+    python -m src.nemotron_speech.modal.asr_server_modal
 
-Environment:
-    Model weights expected in Modal volume at /model/Parakeet_Reatime_En_600M.nemo
 """
 
 import asyncio
@@ -28,8 +26,9 @@ app = modal.App("nemotron-asr-server")
 
 # Model cache volume
 model_cache = modal.Volume.from_name("nemotron-speech", create_if_missing=True)
-CACHE_PATH = "/model"
-MODEL_PATH = "/model/Parakeet_Reatime_En_600M.nemo"
+CACHE_PATH = "/cache"
+
+MODEL_NAME = "nvidia/nemotron-speech-streaming-en-0.6b"
 
 # Define the container image
 image = (
@@ -41,6 +40,8 @@ image = (
     })
     .apt_install("git", "libsndfile1", "ffmpeg")
     .uv_pip_install(
+         "hf_transfer==0.1.9",
+        "huggingface_hub[hf-xet]==0.31.2",
         "numpy<2.0.0",
         "torch",
         "aiohttp",
@@ -54,7 +55,11 @@ image = (
     ).uv_pip_install(
         "nemo_toolkit[asr]@git+https://github.com/NVIDIA/NeMo.git@644201898480ec8c8d0a637f0c773825509ac4dc",
         extra_options="--no-cache",
-    )
+    ).env({
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",
+        "HF_HOME": CACHE_PATH,
+        "TORCH_HOME": CACHE_PATH,
+    })
 )
 
 # Enable debug logging with DEBUG_ASR=1
@@ -112,6 +117,17 @@ class ASRSession:
 
 RIGHT_CONTEXT = 1
 
+with image.imports():
+    import time
+    import torch
+    import traceback
+    from loguru import logger
+    import nemo.collections.asr as nemo_asr
+    from omegaconf import OmegaConf
+
+    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    import uuid
+
 
 # Modal class for ASR inference
 @app.cls(
@@ -129,15 +145,12 @@ class NemotronASRModel:
     @modal.enter()
     def load_model(self):
         """Load model on container startup."""
-        import torch
-        from loguru import logger
-        import nemo.collections.asr as nemo_asr
-        from omegaconf import OmegaConf
         
-        logger.info(f"Loading ASR model from {MODEL_PATH}...")
         
-        self.model = nemo_asr.models.ASRModel.restore_from(
-            MODEL_PATH, map_location='cpu'
+        logger.info(f"Loading ASR model from {MODEL_NAME}...")
+        
+        self.model = nemo_asr.models.ASRModel.from_pretrained(
+            MODEL_NAME
         )
         self.model = self.model.cuda()
         
@@ -213,8 +226,6 @@ class NemotronASRModel:
     
     def _warmup(self):
         """Run warmup inference using streaming API to claim GPU memory."""
-        import torch
-        from loguru import logger
         
         logger.info("Running warmup inference (streaming API) to claim GPU memory...")
         start = time.perf_counter()
@@ -258,7 +269,6 @@ class NemotronASRModel:
         prepended to the accumulated audio to provide encoder left-context.
         This enables seamless transcription across mid-utterance resets.
         """
-        from loguru import logger
         
         # Initialize encoder cache
         cache = self.model.encoder.get_initial_cache_state(batch_size=1)
@@ -288,7 +298,6 @@ class NemotronASRModel:
     
     async def _handle_audio(self, session: ASRSession, audio_bytes: bytes):
         """Accumulate audio and process when enough frames available."""
-        from loguru import logger
         
         audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         
@@ -322,8 +331,6 @@ class NemotronASRModel:
     
     def _process_chunk(self, session: ASRSession) -> Optional[str]:
         """Process accumulated audio, extract new mel frames, run streaming inference."""
-        import torch
-        from loguru import logger
         
         try:
             # Preprocess ALL accumulated audio
@@ -399,9 +406,7 @@ class NemotronASRModel:
                 return session.current_text
         
         except Exception as e:
-            from loguru import logger
             logger.error(f"Session {session.id} chunk processing error: {e}")
-            import traceback
             logger.error(traceback.format_exc())
             return None
     
@@ -426,9 +431,7 @@ class NemotronASRModel:
         - Resets decoder state to prevent corruption from multiple hard resets
         - Preserves encoder cache for acoustic context
         - Used on UserStoppedSpeakingFrame for complete transcription
-        """
-        from loguru import logger
-        import time
+        """        
         
         logger.info(f"Session {session.id} _reset_session START: finalize={finalize}")
         
@@ -519,33 +522,28 @@ class NemotronASRModel:
             f"(cumulative='{final_text[-50:] if len(final_text) > 50 else final_text}')"
         )
         
-        # Remove padding (restore to original audio length)
-        if original_audio_length > 0:
-            session.accumulated_audio = session.accumulated_audio[:original_audio_length]
-        else:
-            session.accumulated_audio = np.array([], dtype=np.float32)
-        
-        # CONTINUOUS SESSION: Keep ALL state intact
-        # The decoder state is preserved to maintain context for subsequent audio.
-        # Server-side deduplication via last_emitted_text ensures clients receive
-        # only new text portions, avoiding downstream duplication in aggregators.
+        # MEMORY BOUNDING: Clear all state after hard reset
+        # This prevents unbounded memory growth by resetting completely each turn:
+        # - Audio buffer: cleared (no carryover between turns)
+        # - Decoder state: reset fresh (no hypothesis accumulation)
+        # - Encoder cache: re-initialized
         #
-        # Note: We considered resetting decoder to prevent corruption from multiple
-        # keep_all_outputs=True calls, but this breaks transcription continuity.
-        # The soft/hard reset distinction helps by limiting keep_all_outputs=True
-        # to only UserStoppedSpeakingFrame events.
-        
+        # We considered keeping audio overlap for encoder context continuity,
+        # but since we reset the encoder cache, overlap audio would just be
+        # re-transcribed, causing duplicates. Clean reset avoids this.
+
+        session.last_emitted_text = ""
+        session.overlap_buffer = None
+        self._init_session(session)
+
         logger.debug(
-            f"Session {session.id} hard reset complete, state preserved: "
-            f"{len(session.accumulated_audio)} samples, {session.emitted_frames} frames"
+            f"Session {session.id} hard reset complete, state fully reset for next turn"
         )
-        
+
         logger.info(f"Session {session.id} _reset_session END: finalize={finalize}")
     
     def _process_final_chunk(self, session: ASRSession) -> Optional[str]:
         """Process all remaining audio with keep_all_outputs=True."""
-        import torch
-        from loguru import logger
         
         try:
             if len(session.accumulated_audio) == 0:
@@ -624,18 +622,13 @@ class NemotronASRModel:
                 return session.current_text
         
         except Exception as e:
-            from loguru import logger
             logger.error(f"Session {session.id} final chunk error: {e}")
-            import traceback
             logger.error(traceback.format_exc())
             return None
     
     @modal.asgi_app()
     def api(self):
         """FastAPI app with ASR WebSocket endpoint."""
-        from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-        from loguru import logger
-        import uuid
         
         web_app = FastAPI(
             title="Nemotron ASR Server (Modal)",
@@ -702,7 +695,6 @@ class NemotronASRModel:
                                     logger.info(f"Client {session_id}: _reset_session completed successfully")
                                 except Exception as e:
                                     logger.error(f"Client {session_id}: _reset_session failed: {e}")
-                                    import traceback
                                     logger.error(traceback.format_exc())
                                     raise
                             else:
@@ -721,7 +713,6 @@ class NemotronASRModel:
             
             except Exception as e:
                 logger.error(f"Client {session_id} error: {e}")
-                import traceback
                 logger.error(traceback.format_exc())
                 try:
                     await websocket.send_json({

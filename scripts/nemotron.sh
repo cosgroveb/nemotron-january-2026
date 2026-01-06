@@ -52,6 +52,10 @@ DEFAULT_Q8_MODEL="$(find "$HOME/.cache/huggingface/hub/models--unsloth--Nemotron
 DEFAULT_Q4_MODEL="$(find "$HOME/.cache/huggingface/hub/models--unsloth--Nemotron-3-Nano-30B-A3B-GGUF" -name "*Q4*.gguf" 2>/dev/null | head -1)"
 DEFAULT_VLLM_MODEL="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 
+# HuggingFace model cache paths for ASR and TTS (auto-downloaded on first run)
+HF_CACHE_ASR="$HOME/.cache/huggingface/hub/models--nvidia--nemotron-speech-streaming-en-0.6b"
+HF_CACHE_TTS="$HOME/.cache/huggingface/hub/models--nvidia--magpie_tts_multilingual_357m"
+
 # Auto-detect LLM mode based on available models (prefer Q8 if available)
 if [[ -n "$DEFAULT_Q8_MODEL" ]]; then
     LLM_MODE="llamacpp-q8"
@@ -256,6 +260,36 @@ cmd_start() {
         esac
     fi
 
+    # Detect if models need to be downloaded (first run)
+    # If ASR or TTS models are not cached, use a longer timeout for download
+    MODELS_TO_DOWNLOAD=""
+    SERVICE_TIMEOUT="${SERVICE_TIMEOUT:-60}"
+
+    if [[ "$ENABLE_ASR" == "true" ]] && [[ ! -d "$HF_CACHE_ASR" ]]; then
+        MODELS_TO_DOWNLOAD="ASR"
+    fi
+    if [[ "$ENABLE_TTS" == "true" ]] && [[ ! -d "$HF_CACHE_TTS" ]]; then
+        if [[ -n "$MODELS_TO_DOWNLOAD" ]]; then
+            MODELS_TO_DOWNLOAD="$MODELS_TO_DOWNLOAD, TTS"
+        else
+            MODELS_TO_DOWNLOAD="TTS"
+        fi
+    fi
+
+    if [[ -n "$MODELS_TO_DOWNLOAD" ]]; then
+        SERVICE_TIMEOUT=600  # 10 minutes for model downloads
+        echo "============================================"
+        echo "FIRST RUN: Models will be downloaded"
+        echo "============================================"
+        echo "  Models to download: $MODELS_TO_DOWNLOAD"
+        echo "  This may take several minutes..."
+        echo "  (Subsequent runs will use cached models)"
+        echo ""
+        echo "  Timeout increased to ${SERVICE_TIMEOUT}s for downloads"
+        echo "============================================"
+        echo ""
+    fi
+
     echo "============================================"
     echo "Starting Nemotron Container"
     echo "============================================"
@@ -308,6 +342,9 @@ cmd_start() {
         DOCKER_ARGS+=(-e "HUGGINGFACE_ACCESS_TOKEN=$HUGGINGFACE_ACCESS_TOKEN")
         DOCKER_ARGS+=(-e "HF_TOKEN=$HUGGINGFACE_ACCESS_TOKEN")
     fi
+
+    # Service timeout (longer for first-run model downloads)
+    DOCKER_ARGS+=(-e "SERVICE_TIMEOUT=$SERVICE_TIMEOUT")
 
     # PyTorch memory allocator config (avoids fragmentation on 32GB GPUs)
     DOCKER_ARGS+=(-e "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")

@@ -36,8 +36,6 @@ Build time: 2-3 hours (builds PyTorch, NeMo, vLLM, llama.cpp from source for CUD
 ./scripts/nemotron.sh start --mode vllm
 ```
 
-**Note**: Set `HUGGINGFACE_ACCESS_TOKEN` environment variable for gated model access.
-
 ### 3. Run the Voice Bot
 
 ```bash
@@ -92,9 +90,19 @@ Three bot implementations are available:
 
 | Bot | Description | Use Case |
 |-----|-------------|----------|
-| `bot_interleaved_streaming.py` | Chunked LLM + adaptive TTS + SmartTurn | Optimized for voice-to-voice latency on a single GPU |
-| `bot_simple_vad.py` | Same as above, but simple VAD (no SmartTurn) | For some use cases, VAD with a fixed silence window is sufficient |
-| `bot_vllm.py` | vLLM + batch TTS + SmartTurn | For production multi-GPU cloud deployment, standard "stream all the tokens" pipeline |
+| `bot_interleaved_streaming.py` | Buffered LLM (single-slot, 100% KV cache) + adaptive TTS + SmartTurn | Optimized for voice-to-voice latency on a single GPU |
+| `bot_simple_vad.py` | Same as above, but simple VAD (fixed silence threshold) | When fixed silence detection is sufficient |
+| `bot_vllm.py` | vLLM + SentenceAggregator + SmartTurn | Production multi-GPU cloud deployment |
+
+### Transport Options
+
+All bots support multiple transport backends via the `-t` flag:
+
+| Transport | Description |
+|-----------|-------------|
+| `webrtc` | Native WebRTC (default) - opens browser at localhost:7860 |
+| `daily` | Daily.co rooms - requires Daily API key |
+| `twilio` | Twilio WebSocket - for telephony integration |
 
 ### bot_interleaved_streaming.py / bot_simple_vad.py
 
@@ -103,6 +111,7 @@ Three bot implementations are available:
 | `NVIDIA_ASR_URL` | `ws://localhost:8080` | ASR WebSocket endpoint |
 | `NVIDIA_LLAMA_CPP_URL` | `http://localhost:8000` | llama.cpp API endpoint |
 | `NVIDIA_TTS_URL` | `http://localhost:8001` | Magpie TTS endpoint |
+| `ENABLE_RECORDING` | `false` | Enable stereo audio recording (user left, bot right) |
 
 ### bot_vllm.py
 
@@ -120,11 +129,13 @@ Custom services in `pipecat_bots/`:
 
 | Service | File | Description |
 |---------|------|-------------|
-| `LlamaCppChunkedLLMService` | `llama_cpp_chunked_llm.py` | Sentence-boundary chunking, two-slot alternation with 2s reuse guard |
+| `LlamaCppBufferedLLMService` | `llama_cpp_buffered_llm.py` | Single-slot operation with SentenceBuffer for 100% KV cache reuse |
 | `MagpieWebSocketTTSService` | `magpie_websocket_tts.py` | Adaptive streaming (fast TTFB first chunk, batch quality after) |
-| `NVidiaWebSocketSTTService` | `nvidia_stt.py` | Real-time streaming ASR |
+| `NVidiaWebSocketSTTService` | `nvidia_stt.py` | Real-time streaming ASR with soft/hard reset support |
+| `SentenceBuffer` | `sentence_buffer.py` | Accumulates LLM output and extracts at sentence boundaries |
+| `V2VMetricsProcessor` | `v2v_metrics.py` | Voice-to-voice response time metrics |
 
-## Container Management
+## Local Container Management
 
 Use `./scripts/nemotron.sh` to manage the container:
 
@@ -160,6 +171,14 @@ Use `./scripts/nemotron.sh` to manage the container:
 ./scripts/nemotron.sh help
 ```
 
+### Service Endpoints
+
+| Service | Port | Protocol | Health Check |
+|---------|------|----------|--------------|
+| ASR | 8080 | WebSocket | `http://localhost:8080/health` |
+| TTS | 8001 | HTTP + WebSocket | `http://localhost:8001/health` |
+| LLM | 8000 | HTTP | `http://localhost:8000/health` |
+
 ## Building the Container
 
 ```bash
@@ -176,165 +195,34 @@ The build compiles from source for CUDA 13.1 / Blackwell (sm_121):
 
 ## Model Requirements
 
-| Model | Source | Size |
-|-------|--------|------|
-| Parakeet ASR | `models/Parakeet_Realtime_En_600M.nemo` | ~2.4GB |
-| Nemotron-3-Nano Q8 | HuggingFace `unsloth/Nemotron-3-Nano-30B-A3B-GGUF` | ~32GB |
-| Nemotron-3-Nano BF16 | HuggingFace `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` | ~72GB |
-| Magpie TTS | Auto-downloaded from HuggingFace | ~1.4GB |
+| Model | Source | Size | Used With |
+|-------|--------|------|-----------|
+| Nemotron Speech ASR | HuggingFace `nvidia/nemotron-speech-streaming-en-0.6b` (auto-downloaded) | ~2.4GB | All configurations |
+| Nemotron-3-Nano Q8 | HuggingFace `unsloth/Nemotron-3-Nano-30B-A3B-GGUF` | ~32GB | llama.cpp on DGX Spark |
+| Nemotron-3-Nano Q4 | HuggingFace `unsloth/Nemotron-3-Nano-30B-A3B-GGUF` | ~16GB | llama.cpp on RTX 5090 |
+| Nemotron-3-Nano BF16 | HuggingFace `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` | ~72GB | vLLM (cloud/multi-GPU) |
+| Magpie TTS | HuggingFace `nvidia/magpie_tts_multilingual_357m` (auto-downloaded) | ~1.4GB | All configurations |
 
-Download models:
+Download LLM models (ASR and TTS are auto-downloaded on first run):
 
 ```bash
-# Q8 GGUF (for llama.cpp)
+# GGUF quantized models (Q8 and Q4 variants for llama.cpp)
 huggingface-cli download unsloth/Nemotron-3-Nano-30B-A3B-GGUF
 
-# BF16 (for vLLM)
+# BF16 full precision (for vLLM)
 huggingface-cli download nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
 ```
 
-## Streaming Architecture & Design Decisions
+## Architecture
 
-This section describes the streaming architecture, frame flow, and key design decisions that enable low-latency voice interaction.
-
-### Pipeline Frame Flow
-
-```
-User speaks → VAD → STT → LLM → TTS → Transport → Audio Out
-                ↑                   │
-                └───────────────────┘
-                  Interruption Loop
-```
-
-**Downstream flow (user input → bot response):**
-1. **VAD** detects speech start → `UserStartedSpeakingFrame`
-2. **STT** sends audio via WebSocket, receives transcripts
-3. **VAD** detects silence → `VADUserStoppedSpeakingFrame` triggers reset
-4. **STT** sends `{"type": "reset"}` → server returns final transcript
-5. **LLM** receives context, generates sentence chunks via `LLMTextFrame`
-6. **TTS** sends chunks via WebSocket, receives binary audio
-7. **Transport** plays `TTSAudioRawFrame` to output device
-
-**Upstream flow (TTS → LLM synchronization):**
-1. TTS receives `segment_complete` from server
-2. TTS pushes `ChunkedLLMContinueGenerationFrame` upstream
-3. LLM receives signal, continues generating next chunk
-
-### Adaptive TTS Mode Selection
-
-The TTS service uses adaptive mode for optimal latency/quality tradeoff:
-
-| Segment | Mode | TTFB | Quality | Rationale |
-|---------|------|------|---------|-----------|
-| First | Streaming | ~370ms | Good | Fast response to user |
-| Subsequent | Batch | ~800ms | Better | User already hearing audio |
-
-**Streaming mode** generates audio frame-by-frame (~46ms chunks) with CFG enabled.
-**Batch mode** generates the full segment before sending.
-
-### Interruption Handling
-
-When the user speaks during bot output:
-
-```
-T=0: User speaks → InterruptionFrame generated
-T=1: Transport clears audio buffers (Pipecat built-in)
-T=2: TTS increments generation counter (_gen++)
-T=3: TTS sends {"type": "cancel"} to server
-T=4: Server cancels audio task, clears queue
-T=5: Stale audio discarded (confirmed_gen != gen)
-T=6: New response starts, stream_created sets confirmed_gen = gen
-T=7: New audio accepted, plays cleanly
-```
-
-**Key design: Generation counter gating**
-- `_gen`: Incremented on interruption
-- `_confirmed_gen`: Set to `_gen` when `stream_created` received
-- Audio only accepted when `_confirmed_gen == _gen`
-
-This handles in-flight audio that arrives after interruption but before the new stream starts.
-
-### TTS Server Protocol
-
-WebSocket at `/ws/tts/stream`:
-
-```
-Client → Server:
-  {"type": "init", "voice": "aria", "language": "en"}
-  {"type": "text", "text": "...", "mode": "stream|batch"}
-  {"type": "close"}   ← Flush remaining, complete normally
-  {"type": "cancel"}  ← Stop immediately (interruption)
-
-Server → Client:
-  {"type": "stream_created", "stream_id": "..."}
-  Binary audio frames (PCM 22kHz 16-bit mono)
-  {"type": "segment_complete", "audio_ms": 1234}
-  {"type": "done", "total_audio_ms": 5432}
-```
-
-**Design decision: Single persistent connection**
-- WebSocket connects on pipeline start, persists until end
-- Interruptions reset server state via `cancel`, don't reconnect
-- Avoids connection overhead (~50ms per reconnect)
-
-### STT Server Protocol
-
-WebSocket at `ws://localhost:8080`:
-
-```
-Client → Server:
-  Binary audio (PCM 16kHz 16-bit mono)
-  {"type": "reset"}  ← Finalize current utterance
-
-Server → Client:
-  {"type": "ready"}
-  {"type": "transcript", "text": "...", "is_final": true|false}
-```
-
-**Design decision: VAD-triggered reset**
-- Reset sent on `VADUserStoppedSpeakingFrame` (after ~200ms silence)
-- Server adds 480ms silence padding for trailing context
-- Lock ensures audio/reset message ordering
-
-### LLM Chunked Generation
-
-The LLM generates responses in sentence-boundary chunks for natural TTS:
-
-```
-LLM generates: "Hello! How can I help you today?"
-         ↓
-Chunk 1: "Hello!"          → TTS → Audio → segment_complete
-         ↓ (wait for TTS)
-Chunk 2: "How can I help you today?" → TTS → Audio → done
-```
-
-**First chunk optimization:**
-- `min_tokens: 10`, `max_tokens: 24`
-- Balances TTFB (~300ms) with natural phrasing
-
-**Two-slot alternation (llama.cpp):**
-- Prevents `GGML_ASSERT(!slot.is_processing())` crash
-- Alternates slots with 2s reuse guard
-- Requires `--parallel 2` on llama-server
-
-### Inter-Sentence Pauses
-
-For natural speech rhythm, 250ms silence is injected after sentence-ending segments:
-
-```
-Segment ends with .!? → segment_complete received
-                      → Check sentence boundary queue
-                      → Inject silence frame if true
-                      → Push ChunkedLLMContinueGenerationFrame
-```
-
-The pause happens *after* the audio plays, not before, preserving low TTFB.
+For detailed architecture documentation including frame flow, protocols, and timing diagrams, see [docs/streaming-pipeline-architecture.md](docs/streaming-pipeline-architecture.md).
 
 ## Troubleshooting
 
-**LLM crashes with `GGML_ASSERT(!slot.is_processing())`**:
-- Ensure `--parallel 2` is set on llama-server (default in unified container)
-- The two-slot implementation prevents this by alternating slots
+**LLM crashes or stalls**:
+- The buffered LLM service uses single-slot operation (`--parallel 1`)
+- Ensure adequate VRAM for context size (default 16384 tokens)
+- Check for httpx connection issues if generation hangs
 
 **vLLM takes 10-15 minutes to start**:
 - This is normal for first startup (model loading, kernel compilation)

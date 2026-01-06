@@ -23,8 +23,8 @@ def _hash_audio(audio: np.ndarray) -> str:
         return "empty"
     return hashlib.md5(audio.tobytes()).hexdigest()[:8]
 
-# Model path
-DEFAULT_MODEL_PATH = "/workspace/models/Parakeet_Reatime_En_600M.nemo"
+# Default model - HuggingFace model name (auto-downloads) or local .nemo path
+DEFAULT_MODEL = "nvidia/nemotron-speech-streaming-en-0.6b"
 
 # Right context options for att_context_size=[70, X]
 RIGHT_CONTEXT_OPTIONS = {
@@ -75,12 +75,12 @@ class ASRServer:
 
     def __init__(
         self,
-        model_path: str,
+        model: str,
         host: str = "0.0.0.0",
         port: int = 8080,
         right_context: int = 1,
     ):
-        self.model_path = model_path
+        self.model_name_or_path = model
         self.host = host
         self.port = port
         self.right_context = right_context
@@ -109,11 +109,22 @@ class ASRServer:
         import nemo.collections.asr as nemo_asr
         from omegaconf import OmegaConf
 
-        logger.info(f"Loading model from {self.model_path}...")
-
-        self.model = nemo_asr.models.ASRModel.restore_from(
-            self.model_path, map_location='cpu'
+        # Detect if model is a local .nemo file or HuggingFace model name
+        is_local_file = (
+            self.model_name_or_path.endswith('.nemo') or
+            os.path.exists(self.model_name_or_path)
         )
+
+        if is_local_file:
+            logger.info(f"Loading model from local file: {self.model_name_or_path}")
+            self.model = nemo_asr.models.ASRModel.restore_from(
+                self.model_name_or_path, map_location='cpu'
+            )
+        else:
+            logger.info(f"Loading model from HuggingFace: {self.model_name_or_path}")
+            self.model = nemo_asr.models.ASRModel.from_pretrained(
+                self.model_name_or_path, map_location='cpu'
+            )
         self.model = self.model.cuda()
 
         # Configure attention context for streaming
@@ -681,7 +692,11 @@ def main():
     parser = argparse.ArgumentParser(description="Nemotron Streaming ASR WebSocket Server")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=8080, help="Port to bind to")
-    parser.add_argument("--model", default=DEFAULT_MODEL_PATH, help="Path to NeMo model")
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help="HuggingFace model name or path to local .nemo file"
+    )
     parser.add_argument(
         "--right-context",
         type=int,
@@ -692,7 +707,7 @@ def main():
     args = parser.parse_args()
 
     server = ASRServer(
-        model_path=args.model,
+        model=args.model,
         host=args.host,
         port=args.port,
         right_context=args.right_context,
